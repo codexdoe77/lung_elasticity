@@ -1,0 +1,836 @@
+/*
+ * Copyright 1993-2012 NVIDIA Corporation.  All rights reserved.
+ *
+ * Please refer to the NVIDIA end user license agreement (EULA) associated
+ * with this source code for terms and conditions that govern your use of
+ * this software. Any use, reproduction, disclosure, or distribution of
+ * this software and related documentation outside the terms of the EULA
+ * is strictly prohibited.
+ *
+ */
+
+/*
+    Particle system example with collisions using uniform grid
+
+    CUDA 2.1 SDK release 12/2008
+    - removed atomic grid method, some optimization, added demo mode.
+
+    CUDA 2.2 release 3/2009
+    - replaced sort function with latest radix sort, now disables v-sync.
+    - added support for automated testing and comparison to a reference value.
+*/
+
+// CUDA runtime
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <helper_math.h>
+
+// CUDA utilities and system includes
+#include <helper_functions.h>
+#include <helper_cuda.h>    // includes cuda.h and cuda_runtime_api.h
+
+// Includes
+#include <stdlib.h>
+#include <time.h>
+#include <cstdlib>
+#include <cstdio>
+#include <algorithm>
+#include <string>
+
+#include "particleSystem.h"
+#include "cmd_option.h"
+
+//#define MAX_EPSILON_ERROR 5.00f   // remnant from CUDA particles code
+#define THRESHOLD         0.25f     // defined for reading MR text files - no longer used
+#define BONE_THRESH       150.f     // default bone threshold in HU
+#define AIR_THRESH        -400.f    // default air threshold in HU
+
+const uint width = 800, height = 800; // rendering window size
+float air_thresh, bone_thresh;        // HU thresholds established to segment the ct input
+
+char *FILE_PREWARP_IN;
+char *FILE_PREWARP_OUT;
+char *DUMP_FOLDER;
+
+DICOM_CT *input_ct;          // structure to hold all data from the input ct dicom
+DICOM_STRUCT *structures;      // structure to hold all data from the input dicomrt structures
+bool useInput = false;      // boolean to signal that a dicom ct was input
+bool useContour = false;    // boolean to signal that a dicomrt structure was input
+bool useOpenGL = false;
+bool m_bAnchor = false;
+char *UVW_file;
+char *geom_file;
+char *elas_file;
+char *static_in;
+
+dim3 cudaBlock(16, 16);
+dim3 cudaGrid;
+cudaExtent volumeSize = make_cudaExtent(128, 128, 128);
+CHARDATA_VOLUME vdens1;
+
+// booleans describing the current state of the simulation
+
+bool UVW = false;
+bool tolFilter = false;
+bool geom = false;
+bool set_gravXY = false;
+bool uvwON = false;
+bool set_cum_tolerance = true;
+bool set_initialGT = true;
+bool set_initialRL = true;
+bool deform = false;
+bool initialIteration = true;
+bool revertRL = false;
+bool set_grav = true;
+bool xy = false;
+bool SA_iterations = false;
+bool displayEnabled = true;
+bool connectionSet = true;
+bool bPause = false;
+bool displaySliders = false;
+bool wireframe = false;
+bool demoMode = false;
+bool realTime = false;
+
+uint colorSwitcher = 0;         // enumerator indicating which color map to render - anatomy / displacement / strain energy
+uint contourSwitch = 0;         // enumerator indicating which contour is currently under control allowing rest length manipulation by the user
+uint cntr_count = 0;            // total number of contours loaded by the user
+
+uint userSize = 0;
+uint osc_axis = 2;
+uint oscillator = 0;
+float amplitude = 0.f;
+
+int idleCounter = 0;            // counts the frames without user interaction to trigger demo mode - currently disabled
+int demoCounter = 0;            // counter for demo mode to switch the system intializiation state - cube / sphere / pyramid
+const int idleDelay = 2000;     // number of idle frames before initializing demo mode
+
+// Global Space Definers
+uint numParticles = 0;          // total particles in the simulation
+uint staticParticles = 0;       // number of static particles of the bony anatomy
+uint dynamicParticles = 0;      // number of dynamic particles of soft tissue
+float boundaryMultiplier = 0.00005; //Magnifies boundary pull accordingly. Default 0.00005.
+uint3 gridSize;                 // the size of the global rendering space divided into voxels
+uint3 dataSize;                 // the size of the input data volume in voxels
+float3 voxelSize;               // the size of the voxels of the input data volume in mm
+float3 worldSize;               // the total size of the global rendering space in mm
+//int numIterations = 0; // run until exit
+
+// simulation parameters
+float timestep = TIMESTEP;  // seconds
+float damping = DAMPING;    // unitless
+float gravity = 0.0f;    // scaling factor (0 -> 2) x acceleration due to gravity
+float grav[] = {0, 0, 0};   // gravity vector allwos gravity to rotate as the user changes views
+//int iterations = 1
+
+int ballRadius = 20;        // Radius of particle sphere in particles
+
+// Particle-Particle collision data
+float collideSpring = 0.f;
+float collideDamping = 0.f;
+float collideShear = 0.f;
+float collideAttraction = 0.f;
+
+// Theoretical Units shown, actual calculation performed in generic normalized grid units (-1,1) in each direction
+// Hooke's Law
+float springStrength = 0.20f;           // N/m
+float springDamping  = 0.0f;
+// Strain Energy Equation
+float energyModulus = 0.f;            // GPa, 10^9 N/m^2
+// Young & Shear Modulus Equation
+float elasticModulus = ELASTIC_MOD;           // GPa, 10^9 N/m^2
+float shearModulus   = SHEAR_MOD * ELAS_SCALE;           // GPa, 10^9 N/m^2
+// Lennard-Jones Bi-Reciprocal Equation
+float minPotential   = 0.f;
+float stretch_x      = 0.f;
+float stretch_y      = 0.f;
+
+// Head Rotation Variables
+float headLevel = 0.f;          // initial level above which the bony anatomy will rotate during headRotation - initialized by examing the mandible contour if possible
+                                // can be adjusted in the slider bar menu
+uint headSwitch = 0;            // indicates which axis to rotate about - x / y / z
+
+uint profileSwitch = 0;         // indicates which data to dump during dumpProfiles - position / velocity / color
+
+float *restLength;              // Multiplier to globally change the rest length of particle-particle connections: ranges from 0.5 to 2.5
+float restLengthSlider = 1.f;   // variable to hold the user adjusted value in the slider bar menu
+
+// fps
+static int fpsCount = 0;
+static int fpsLimit = 1;
+StopWatchInterface *timer = NULL;
+
+ParticleSystem *psystem = 0;
+
+// Auto-Verification Code
+const int frameCheckNumber = 4;
+unsigned int frameCount = 0;
+
+const char *sSDKsample = "Anatomy Mass-Spring Simulation";
+
+extern "C" void cudaInit(int argc, char **argv);
+
+int iDivUp(int a, int b){
+    return (a % b != 0) ? (a / b + 1) : (a / b);
+}
+
+/*
+Resets the rest length modifier of each contour to 1.
+Launched when the system is reset using the keys '1','2','3','4','7','8'
+*/
+void resetRestLength()
+{
+    restLengthSlider = 1.f;
+    uint count = 1;
+    if (useContour)
+        count += structures->CTRnumber;
+    for (uint i=0; i<count; i++)
+        restLength[i] = 1.f;
+
+    psystem->resetRestLength();
+}
+
+// initialize particle system
+void initParticleSystem(uint numParticles, uint staticParticles, uint dynamicParticles, uint3 dataSize, uint3 gridSize, float3 voxelSize, bool bUseOpenGL)
+{
+
+    printf(" Particle system is initialized %d\n", useInput); fflush(stdout);
+    psystem = new ParticleSystem(numParticles, staticParticles, dynamicParticles, dataSize, gridSize, voxelSize, bUseOpenGL, useInput, useContour, input_ct->segment, &input_ct->dataset, structures, air_thresh, bone_thresh, headLevel, geom, geom_file,m_bAnchor);
+    
+    psystem->FILE_PREWARP_IN = FILE_PREWARP_IN;
+    psystem->FILE_PREWARP_OUT = FILE_PREWARP_OUT;
+    psystem->DUMP_FOLDER = DUMP_FOLDER;
+
+    if (useInput)
+        {
+            psystem->systemReset(ParticleSystem::CONFIG_INPUT, input_ct->dir, false, true, userSize, useInput, true);
+        }
+
+    psystem->populateDataFromFile(&input_ct->dataset,FILE_PREWARP_IN);
+    std::cout <<" populate data from File completed \n";
+    psystem->resetTime();
+
+    sdkCreateTimer(&timer);
+    printf("\n Initialized! \n"); fflush(stdout);
+    psystem->dumpElasticity(input_ct->dir, &input_ct->dataset, structures, &input_ct->files, input_ct->type, input_ct->dataset.array3D);
+    // exit(0);
+
+
+
+}
+
+void resetParticleSystem(uint numParticles, uint staticParticles, uint dynamicParticles, uint3 dataSize, uint3 gridSize, float3 voxelSize, bool bUseOpenGL)
+{
+    psystem->systemReset(ParticleSystem::CONFIG_POS_RESET, input_ct->dir, true, false, userSize, useInput, initialIteration);
+    psystem->resetTime();
+    sdkCreateTimer(&timer);
+}
+
+/*
+Free allocated memory
+*/
+void cleanup()
+{
+    psystem->finalFree();
+    if (useInput)
+    {
+        free(input_ct->segment);
+        free(input_ct->dataset.array3D);
+        if (useContour)
+        {
+            for (int c=0; c<structures->CTRnumber; c++)
+            {
+                if(structures->include[c] != 0)
+                {
+                    free(structures->contour[c].matrix);
+                    free(structures->contour[c].CTRpoints);
+                    free(structures->contour[c].lm_index);
+                }
+            }
+            delete structures->contour;
+            free(structures->include);
+            free(structures->cntrParticles);
+            free(structures->cntrSegData);
+        }
+        free(restLength);
+    }
+
+    sdkDeleteTimer(&timer);
+}
+
+
+/*
+Computes the frames per second. Gives a measure of the calculation speed of the GPU
+*/
+void computeFPS(float iteration_counter)
+{
+    frameCount++;
+    fpsCount++;
+
+
+    if (fpsCount == fpsLimit)
+    {
+        char fps[256];
+        float ifps = 1.f / (sdkGetAverageTimerValue(&timer) / 1000.f);
+        sprintf(fps, "cmdAnatomy (%d mass elements): %3.1f fps, Iteration Number : %4.1f", numParticles, ifps,iteration_counter);
+        fpsCount = 0;
+        fpsLimit = (int)MAX(ifps, 1.f);
+        sdkResetTimer(&timer);
+    }
+}
+
+
+/*
+This display loop runs each iteration, it form the bulk of the glut main loop.
+User input is transferred to the particle system class, and then to the GPU for simulation
+calculations.
+*/
+
+float simTime = 0.f;                                //float, copied from particleSystem.cpp to represent simulation time.
+uint iteration_counter=0;                           //Counts number of time steps
+uint reset_counter=0;                               //Counter for iteration number (elasticity algorithm step)
+float4 averages = make_float4(0.f,0.f, 0.f, 0.f);
+float particle_tolerance = PARTICLE_TOL;            // cost threshold
+float stalled_tolerance = STALL_TOL;
+float last_tolerance = 0.f;
+float new_tolerance = 0.f;
+float cumulative_tolerance = 0;
+float last_elastic = 0.f;
+float best_elastic = 0.f;
+float last_convergence = 0.f;
+float best_convergence = 0.f;
+char best_buffer[32];
+char best_buffer_converge[32];
+char first_buffer[32];
+char init_buffer[32];
+int last_guess;
+int best_guess;
+float new_error = 100000000;
+float last_error = 100000000;
+float best_error = 100000000;
+uint loop_counter = 0;                                //Counts number of times through Simulated Annealing Loop, or number of stalls
+uint counter_limit = 50;                          //Limit of number of times through Simulated Annealing Loop, or number of stalls
+int step_size = 600;                      //step size
+bool best = false;
+float2 boundDisp = make_float2(0.f, 0.f);
+
+void resetSystemParameters()
+{
+    psystem->systemReset(ParticleSystem::CONFIG_INPUT, input_ct->dir, true, false, userSize, useInput, false);
+
+    set_cum_tolerance = false;
+
+    iteration_counter = 0;
+
+    gravity = 0.f;
+    set_grav = true;
+    psystem->setGravity(0,0,0);
+    damping = DAMPING;
+}
+
+void display_UpdateParticleSystemGlobalParams()
+{
+    sdkStartTimer(&timer);
+    float worldMax = std::max( worldSize.x, std::max( worldSize.y, worldSize.z) );
+
+    if (set_initialRL)
+    {
+        psystem->recordRestLengths(deform, set_initialRL);
+        set_initialRL = false;
+    }
+    psystem->setDamping(damping);
+    if (set_grav)
+    {
+        grav[0] = 0*gravity * ACCEL_GRAV;//gravity * ACCEL_GRAV; // * sin(camera_rot_lag[0]*PI/180) * sin(camera_rot_lag[1]*PI/180) / (0.5f * gridSize.x * voxelSize.x);
+        grav[1] = 0*gravity * ACCEL_GRAV; //gravity * ACCEL_GRAV; // * cos(camera_rot_lag[0]*PI/180) / (0.5f * gridSize.y * voxelSize.y);
+        grav[2] = 1*gravity * ACCEL_GRAV; // * sin(camera_rot_lag[0]*PI/180) * cos(camera_rot_lag[1]*PI/180) / (0.5f * gridSize.z * voxelSize.z);
+        psystem->setGravity(grav[0],grav[1],grav[2]);
+    }
+    if (set_gravXY)
+    {
+        grav[0] = 1*gravity * ACCEL_GRAV;
+        grav[1] = 1*gravity * ACCEL_GRAV;
+        grav[2] = 0*gravity * ACCEL_GRAV;
+        psystem->setGravity(grav[0],grav[1],grav[2]);
+    }
+
+    psystem->setCollideSpring(collideSpring);
+    psystem->setCollideDamping(collideDamping);
+    psystem->setCollideShear(collideShear);
+    psystem->setCollideAttraction(collideAttraction);
+
+    psystem->setSpringConstant(springStrength);
+    psystem->setSpringDamping(springDamping);
+
+    psystem->setShearModulus(shearModulus);
+
+    psystem->setMinimumPotential(minPotential);
+    psystem->setStretchiness(stretch_x,stretch_y);
+
+    restLengthSlider = 1.f;
+    restLength[contourSwitch] = restLengthSlider;
+    psystem->setRestLength(restLength[contourSwitch]);
+    psystem->accumulateTime(timestep);
+
+    simTime = psystem->update(timestep, iteration_counter);
+}
+
+void display_UpdateParticleSystemSimulation()
+{
+    if (iteration_counter == 0)
+    {
+
+        psystem->recordRestLengths(deform, initialIteration);
+        psystem->resetElasticModuli(0.f, false,iteration_counter, false);
+
+        gravity = 0;
+        set_grav = true;
+        damping = DAMPING;
+
+    }
+    else
+    {
+        if (iteration_counter == ITERATION_BOUNDARY)
+        {
+            psystem->moveBoundaryToTarget(&input_ct->dataset, iteration_counter);
+        }
+        if (iteration_counter > ITERATION_BOUNDARY && iteration_counter <= ITERATION_INNER)
+        {
+            psystem->moveInnerVoxelsToTarget(&input_ct->dataset, iteration_counter);
+        }
+
+    }
+    if (realTime) // set timeStep to inverse fps
+    {
+        timestep = sdkGetAverageTimerValue(&timer) / 1000.f;
+    }
+}
+
+
+void display()
+{
+    printf("\n iteration counter = %d\n",iteration_counter);
+    if (iteration_counter == ITERATION_EQ)
+    {
+        psystem->dumpTarget();
+        exit(EXIT_SUCCESS);
+    }
+
+    display_UpdateParticleSystemGlobalParams();
+    display_UpdateParticleSystemSimulation();
+    iteration_counter++;
+    computeFPS(iteration_counter);
+}
+
+void printCommandLineHelp()
+{
+  printf("\n Command Line Flags:");
+            printf("\n    -help:     Display all flag options.");
+            printf("\n    -n:        Set number of particles for generic system. Default = 32678.");
+            printf("\n    -grid:     Set sizeof cubic grid. Default = 96.");
+            printf("\n    -input:    Prompts a file chooser window to select data folder containing DICOM or text files for input data set.");
+            printf("\n               Text files require a parameter file within the data folder containing image dimensions and voxel size in mm.");
+            printf("\n               Overrides -n and -grid flags.");
+            printf("\n    -ct:       Modifier of -input flag. Signals program to use air and bone thresholds to fill dataset. Default values set at -400 and 150 HU. ");
+            printf("\n               Other input (i.e. MR) can be thresholded through the parameter file, or will employ a binary default threshold of 0.");
+            printf("\n    -athresh:  Modifier of -input flag. Manually set the threshold of air for CT input. Default is -400 HU.");
+            printf("\n               Voxels below this value will not be included in the simulation data set.");
+            printf("\n    -bthresh:  Modifier of -input flag. Manually set the threshold of bone for CT input. Default is 150 HU.");
+            printf("\n               Voxels above this value are considered fixed points during simulation.");
+            printf("\n    -struct:   Modifier of -ct flag. Prompts a file chooser window to select a folder containing an RTSTRUCT file of contours corresponding to input data.");
+            printf("\n               User will have the option to select which contours to load. (If multiple Struct folders, select High)");
+            printf("\n               Applications are contour specific material properties, targeted volume changes,");
+            printf("\n               localized analysis, etc.");
+            printf("\n    -body:     Modifier of -struct flag. Automatically load body contour and eliminate any voxels outside of body contour from the simulation data set.");
+            printf("\n    -parse:    Modifier of -struct flag. Similarly remove all voxels not contained within the selected array of contours.");
+            printf("\n               This option currently does not remove the skeletal structure, however.\n");
+            printf("\n  -downSample  Set the factor to down sample the x-y directions. (-downSample=2 will reduce a 512x512 image to 256x256)\n");
+}
+
+
+void checkandloadInputCT(int argc, char **argv)
+{
+      float inputThreshold = THRESHOLD;
+  if (checkCmdLineFlag(argc, (const char **)argv, "input"))
+    {
+
+            getCmdLineArgumentString( argc, (const char**)argv, "input", &input_ct->dir );
+            printf("\n Input Path: %s",input_ct->dir);
+            fflush(stdout);
+
+
+            // check for the flag to down-sample the input data
+            int downSamp = 1;
+            if(checkCmdLineFlag(argc, (const char**)argv, "downSample"))
+                downSamp = getCmdLineArgumentInt(argc, (const char **)argv, "downSample");
+            bool zdown = false;
+            if(checkCmdLineFlag(argc, (const char**)argv, "zdown"))
+                zdown = true;
+
+            char *params_file;
+            if (checkCmdLineFlag(argc, (const char **) argv, "params"))
+            {
+                getCmdLineArgumentString( argc, (const char**)argv, "params" ,&params_file );
+                printf("\n Parameter File: %s",params_file);fflush(stdout);
+            }
+
+            if (checkCmdLineFlag(argc, (const char **) argv, "geometry"))
+            {
+                getCmdLineArgumentString( argc, (const char**)argv, "geometry" ,&geom_file );
+                printf("\n Geometry File: %s",geom_file);
+                geom = true;
+            }
+            if (checkCmdLineFlag(argc, (const char **) argv, "elasFile"))
+            {
+                getCmdLineArgumentString( argc, (const char**)argv, "elasFile" ,&elas_file );
+                printf("\n Elasticity File: %s",elas_file);
+            }
+            if (checkCmdLineFlag(argc, (const char **) argv, "static"))
+            {
+                getCmdLineArgumentString( argc, (const char**)argv, "static" ,&static_in );
+                printf("\n Static Row: %s",static_in);fflush(stdout);
+                m_bAnchor = true;
+            }
+
+            if (checkCmdLineFlag(argc, (const char **) argv, "xy"))
+            {
+                xy = true;
+                if (xy)
+                {
+                    set_gravXY = true;
+                    printf("\n Evaluating XY Perturbation Force");
+                }
+            }
+            if (checkCmdLineFlag(argc, (const char **) argv, "boundaryMultiplier"))
+            {
+                boundaryMultiplier = getCmdLineArgumentFloat(argc, (const char **)argv, "boundaryMultiplier");
+                printf("\n Boundary Multiplier: %4.6f", boundaryMultiplier);
+            }
+
+            //Load DICOM files from input directory
+            load_files(input_ct->dir,&input_ct->files,&input_ct->dataset,input_ct->type,input_ct->date,downSamp);
+            printf("\n Data is type %s ",input_ct->type); fflush(stdout);
+
+
+
+            // if the input data is in text file format, search for a parameter file defining the array size and voxel size
+            int y = strncmp(input_ct->type,"txt",3);
+
+            bool ytrue = false;
+            if (y == 0)
+            {
+                ytrue = true;
+            }
+            if ( ytrue )
+            {
+                char name[255];
+                sprintf(name, "%s", params_file);
+
+                FILE *fp;
+                fp = fopen(name, "r");
+
+                if (fp != NULL)
+                    {
+                        fscanf(fp,"%d %d %d %f %f %f %f",&dataSize.x,&dataSize.y,&dataSize.z,&voxelSize.x,&voxelSize.y,&voxelSize.z,&inputThreshold);
+                    }
+                else
+                    {
+                        printf("LOAD PARAMETER FILE ERROR \n");
+                    }
+
+
+
+                dataSize.x /= downSamp;
+                dataSize.y /= downSamp;
+                dataSize.z /= downSamp;
+                input_ct->dataset.params.arraySize.x = dataSize.x;
+                input_ct->dataset.params.arraySize.y = dataSize.y;
+                input_ct->dataset.params.arraySize.z = dataSize.z;
+                if (zdown) dataSize.z /= downSamp;
+                voxelSize.x /= 1000.f;
+                voxelSize.y /= 1000.f;
+                voxelSize.z /= 1000.f;
+                input_ct->dataset.params.voxelSize.x = voxelSize.x;
+                input_ct->dataset.params.voxelSize.y = voxelSize.y;
+                input_ct->dataset.params.voxelSize.z = voxelSize.z;
+                fclose(fp);
+
+
+
+            }
+            else
+            {
+                // assuming DICOM format, assign the array size and voxel size to the global variables
+                dataSize.x = input_ct->dataset.params.arraySize.x / downSamp;
+                dataSize.y = input_ct->dataset.params.arraySize.y / downSamp;
+                dataSize.z = input_ct->dataset.params.arraySize.z;
+                if (zdown) dataSize.z/=downSamp;
+                voxelSize.x = (input_ct->dataset.params.voxelSize.x * (float)downSamp) / 1000.f;
+                voxelSize.y = (input_ct->dataset.params.voxelSize.y * (float)downSamp) / 1000.f;
+                voxelSize.z = input_ct->dataset.params.voxelSize.z / 1000.f;
+                if (zdown) voxelSize.z *= (float)downSamp;
+            }
+
+            // load the pixel data from the DICOM files
+            load_data(input_ct->dir,&input_ct->files,&input_ct->dataset,input_ct->type,downSamp,zdown);
+
+
+            // adjust the parameters for down-sampling
+            input_ct->dataset.params.arraySize.x /= downSamp;
+            input_ct->dataset.params.arraySize.y /= downSamp;
+            input_ct->dataset.params.voxelSize.x *= downSamp;
+            input_ct->dataset.params.voxelSize.y *= downSamp;
+            if (zdown)
+            {
+                input_ct->dataset.params.arraySize.z /= downSamp;
+                input_ct->dataset.params.voxelSize.z *= downSamp;
+            }
+
+            // initialize the particle counter to zero
+            numParticles = 0;
+            dynamicParticles = 0;
+            staticParticles = 0;
+
+            // establish the size of the global rendering space grid at 20 units larger than the array size
+            gridSize.x = 20 + dataSize.x;
+            gridSize.y = 20 + dataSize.y;
+            gridSize.z = 20 + dataSize.z;
+
+
+            // allocate and initialize the enumerator array
+            input_ct->segment = (int*)malloc( dataSize.x * dataSize.y * dataSize.z * sizeof(int) );
+
+            memset( input_ct->segment, 0, dataSize.x * dataSize.y * dataSize.z * sizeof(int) );
+
+            // set the air and bone thresholds to default value, then check for command line flags
+            air_thresh = AIR_THRESH;
+            bone_thresh = BONE_THRESH;
+            if (checkCmdLineFlag(argc, (const char **)argv, "bthresh"))
+                bone_thresh = getCmdLineArgumentFloat(argc, (const char **)argv, "bthresh");
+            if (checkCmdLineFlag(argc, (const char **)argv, "athresh"))
+                air_thresh = getCmdLineArgumentFloat(argc, (const char **)argv, "athresh");
+
+            // check for the CT command line flag.
+            // if found, this will apply the air and bone thresholds to the data.
+            // values below the air threshold will not be rendered, value above the bone threshold will be considered static
+
+            if (checkCmdLineFlag(argc, (const char **)argv, "ct"))
+            {
+                printf("\n Soft Tissue: %3.2f -> %3.2f\n",air_thresh,bone_thresh); fflush(stdout);
+                char outpath[255];
+                sprintf(outpath, "%s/Array.txt", DUMP_FOLDER);
+                std::ofstream output_Array;
+                output_Array.open(outpath);
+                // check for command line flags indicating that only bone or only soft tissue is to be rendered
+                uint check = 0;
+                if (checkCmdLineFlag(argc, (const char **)argv, "bonly")) check++;
+                if (checkCmdLineFlag(argc, (const char **)argv, "sonly")) check--;
+
+                for (uint n=0; n<dataSize.x*dataSize.y*dataSize.z; n++)
+                {
+                    // add both bone and soft tissue to the particle array for rendering
+                    if (check==0)
+                    {
+                        if (input_ct->dataset.array3D[n] > bone_thresh)
+                        {
+                            numParticles++;
+                            staticParticles++;
+                            input_ct->segment[n] = -1000;
+                        }
+                        else if (input_ct->dataset.array3D[n] > air_thresh)
+                        {
+                            numParticles++;
+                            dynamicParticles++;
+                            input_ct->segment[n] = 1000;
+                        }
+                        else input_ct->segment[n] = 0;
+                    }
+                    // add only bone to the particle array for rendering
+                    else if (check==1)
+                    {
+                        if (input_ct->dataset.array3D[n] > bone_thresh)
+                        {
+                            numParticles++;
+                            staticParticles++;
+                            input_ct->segment[n] = -1000;
+                        }
+                        else input_ct->segment[n] = 0;
+                    }
+                    // add only soft tissue to the particle array for rendering
+                    else
+                    {
+
+                        // if (input_ct->dataset.array3D[n] < -600 && input_ct->dataset.array3D[n] > -800) //for lung data
+                        if (input_ct->dataset.array3D[n] != 0) // && input_ct->dataset.array3D[n] > -1100) //for lung data
+                        // if (input_ct->dataset.array3D[n] < bone_thresh && input_ct->dataset.array3D[n] > air_thresh)
+                        {
+                            output_Array << n << ", " << input_ct->dataset.array3D[n] << std::endl;
+                            (n == dataSize.x * dataSize.y * dataSize.z - 1) ? output_Array << std::endl : output_Array << " ";
+                            numParticles++;
+                            dynamicParticles++;
+                            input_ct->segment[n] = 1000;
+
+                        }
+                        else input_ct->segment[n] = 0;
+                    }
+                }
+                output_Array.close();
+            }
+
+            // if no RTSTRUCT is defined, create a single global rest length multiplier
+            restLength = (float*)malloc(sizeof(float));
+            restLength[0] = 1.f;
+            
+            // set the input boolean to true
+            useInput = true;
+    }
+}
+
+
+void checkandloadOutputDirectories(int argc, char **argv)
+{
+    if (checkCmdLineFlag(argc, (const char **) argv, "FILE_PREWARP_IN"))
+    {
+        getCmdLineArgumentString( argc, (const char**)argv, "FILE_PREWARP_IN" ,&FILE_PREWARP_IN );
+        //std::cout << "FILE_PREWARP_IN: " << FILE_PREWARP_IN << std::endl;
+    }
+
+    if (checkCmdLineFlag(argc, (const char **) argv, "FILE_PREWARP_OUT"))
+    {
+        getCmdLineArgumentString( argc, (const char**)argv, "FILE_PREWARP_OUT" ,&FILE_PREWARP_OUT );
+        //std::cout << "FILE_PREWARP_OUT: " << FILE_PREWARP_OUT << std::endl;
+    }
+
+    if (checkCmdLineFlag(argc, (const char **) argv, "DUMP_FOLDER"))
+    {
+        getCmdLineArgumentString( argc, (const char**)argv, "DUMP_FOLDER" ,&DUMP_FOLDER );
+        //std::cout << "FILE_PREWARP_OUT_DIR: " << FILE_PREWARP_OUT_DIR << std::endl;
+    }
+}
+
+void initContourSegmentData()
+{
+  if (useInput && useContour)
+    {
+        int count2 = structures->cntr_count;
+        for ( int i=0; i<2*structures->cntr_count; i++)
+        {
+            for( int j=1; j<count2; j++)
+            {
+                if ( structures->cntrSegData[j-1] > structures->cntrSegData[j] )
+                {
+                    int tempint = structures->cntrSegData[j];
+                    structures->cntrSegData[j] = structures->cntrSegData[j-1];
+                    structures->cntrSegData[j-1] = tempint;
+                }
+            }
+            count2--;
+        }
+        printf("\n Contour Segment Data - Sorted:  ");
+        for (int i=0; i<structures->cntr_count; i++)
+                printf(" %d ",structures->cntrSegData[i]);
+    }
+
+}
+
+void printParticlesStatus()
+{
+    printf("\n voxel (m): %2.2g x %2.2g x %2.2g", voxelSize.x, voxelSize.y, voxelSize.z ); fflush(stdout);
+    printf("\n data: %d x %d x %d = %d voxels", dataSize.x, dataSize.y, dataSize.z, dataSize.x*dataSize.y*dataSize.z);
+    printf("\n grid: %d x %d x %d = %d cells", gridSize.x, gridSize.y, gridSize.z, gridSize.x*gridSize.y*gridSize.z); fflush(stdout);
+    printf("\n Total Particles: %d", numParticles); fflush(stdout);
+    printf("\n Static Particles: %d", staticParticles); fflush(stdout);
+    printf("\n Dynamic Particles: %d\n", dynamicParticles); fflush(stdout);
+}
+void checkandsetGrid(int argc, char ** argv)
+{
+  if (checkCmdLineFlag(argc, (const char **) argv, "grid"))
+            {
+                uint gridDim = getCmdLineArgumentInt(argc, (const char **) argv, "grid");
+                gridSize.x = gridSize.y = gridSize.z = gridDim;
+            }
+
+}
+////////////////////////////////////////////////////////////////////////////////
+// Program main
+////////////////////////////////////////////////////////////////////////////////
+int
+main(int argc, char **argv)
+{
+    printf("%s Starting...\n", sSDKsample);
+
+    numParticles = NUM_PARTICLES;
+    staticParticles = 0;
+    dynamicParticles = NUM_PARTICLES;
+    float voxelDim = VOXEL_SIZE;
+    dataSize.x = dataSize.y = dataSize.z = 0;
+    voxelSize.x = voxelSize.y = voxelSize.z = voxelDim;
+    float dim = pow( (float)numParticles, (1.f/3.f) ); //length of a side of the particle cube
+    gridSize.x = gridSize.y = gridSize.z = 3 * (uint)dim; //set grid size to twice the size of the particle cube
+   //set grid size to twice the size of the particle cube
+    //numIterations = 0;
+    float inputThreshold = THRESHOLD;
+
+    cudaGrid = dim3(iDivUp(width, cudaBlock.x), iDivUp(height, cudaBlock.y));
+//    initPixelBuffer();
+
+    cudaInit(argc, argv);
+
+    input_ct = new DICOM_CT;
+
+    if (argc > 1)
+    {
+        if (checkCmdLineFlag(argc, (const char**)argv, "help"))
+        {
+            printCommandLineHelp(); return SUCCESS;
+        }
+
+            // Get declared input directory
+        checkandloadInputCT(argc, argv);
+        checkandloadOutputDirectories(argc, argv);
+
+        if (checkCmdLineFlag(argc, (const char **) argv, "UVW"))
+        {
+            UVW = true;
+            uvwON = true;
+            getCmdLineArgumentString( argc, (const char**)argv, "UVW" ,&UVW_file );
+            // psystem->populateDataFromFile(&input_ct->dataset,FILE_PREWARP_IN);
+            // psystem->loadUVW(FILE_PREWARP_IN,input_ct->dataset.array3D);
+            fflush(stdout);
+        }
+
+    }
+    else
+    {
+        // if there are no command line arguments
+        // create a single global rest length multiplier
+        restLength = (float*)malloc(sizeof(float));
+        restLength[0] = 1.f;
+    }
+
+    // Command line parsing completed
+
+    initContourSegmentData();
+    printParticlesStatus();
+
+    // initalize the particle system, parameters, and menus
+    initParticleSystem(numParticles, staticParticles, dynamicParticles, dataSize, gridSize, voxelSize, useOpenGL);
+
+    // begin the main glut loop
+    printf("\n running without rendering...");
+
+    while(iteration_counter <= ITERATION_EQ) {
+        display();
+    }
+
+    if (psystem)
+        delete psystem;
+    if (input_ct)
+        delete input_ct;
+    if (structures)
+        delete structures;
+
+    cudaDeviceReset();
+
+    exit(EXIT_SUCCESS);
+}

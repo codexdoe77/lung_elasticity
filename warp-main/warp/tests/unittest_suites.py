@@ -1,0 +1,440 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Warp Test Suites
+
+This file is intended to define functions that return TestSuite objects, which
+can be used in parallel or serial unit tests (with optional code coverage)
+"""
+
+# ruff: noqa: PLC0415
+
+import os
+import sys
+import unittest
+
+START_DIRECTORY = os.path.realpath(os.path.dirname(__file__))
+TOP_LEVEL_DIRECTORY = os.path.realpath(os.path.join(START_DIRECTORY, "..", ".."))
+
+
+def _create_suite_from_test_classes(test_loader, test_classes):
+    suite = unittest.TestSuite()
+
+    for test in test_classes:
+        sub_suite = unittest.TestSuite()
+        # Note that the test_loader might have testNamePatterns set
+        sub_suite.addTest(test_loader.loadTestsFromTestCase(test))
+        suite.addTest(sub_suite)
+
+    return suite
+
+
+def auto_discover_suite(loader=unittest.defaultTestLoader, pattern="test*.py"):
+    """Uses unittest auto-discovery to build a test suite (test_*.py pattern)"""
+
+    return loader.discover(start_dir=START_DIRECTORY, pattern=pattern, top_level_dir=TOP_LEVEL_DIRECTORY)
+
+
+def _iter_class_suites(test_suite):
+    """Iterate class-level test suites - test suites that contains test cases
+
+    From unittest_parallel.py
+    """
+    has_cases = any(isinstance(suite, unittest.TestCase) for suite in test_suite)
+    if has_cases:
+        yield test_suite
+    else:
+        for suite in test_suite:
+            yield from _iter_class_suites(suite)
+
+
+def compare_unittest_suites(
+    test_loader: unittest.TestLoader, test_suite_name: str, reference_suite: unittest.TestSuite
+) -> None:
+    """Prints the tests in `test_suite` that are not in `reference_suite`."""
+
+    test_suite_fn = getattr(sys.modules[__name__], test_suite_name + "_suite")
+
+    test_suite = test_suite_fn(test_loader)
+
+    test_suite_classes_str = {
+        type(test_suite._tests[0]).__name__
+        for test_suite in list(_iter_class_suites(test_suite))
+        if test_suite.countTestCases() > 0
+    }
+
+    reference_suite_classes_str = {
+        type(test_suite._tests[0]).__name__
+        for test_suite in list(_iter_class_suites(reference_suite))
+        if test_suite.countTestCases() > 0
+    }
+
+    set_difference = reference_suite_classes_str - test_suite_classes_str
+
+    print(f"Selected test suite '{test_suite_name}'")
+    if len(set_difference) > 0:
+        print(f"Test suite '{test_suite_name}' omits the following test classes:")
+        for test_entry in set_difference:
+            print(f"    {test_entry}")
+
+    return test_suite
+
+
+def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader):
+    """Example of a manually constructed test suite.
+
+    Intended to be modified to create additional test suites
+    """
+    from warp.tests.cuda.test_async import TestAsync
+    from warp.tests.cuda.test_cuda_arch_suffix import TestCudaArchSuffix
+    from warp.tests.cuda.test_mempool import TestMempool
+    from warp.tests.cuda.test_multigpu import TestMultiGPU
+    from warp.tests.cuda.test_peer import TestPeer
+    from warp.tests.cuda.test_pinned import TestPinned
+    from warp.tests.cuda.test_streams import TestStreams
+    from warp.tests.cuda.test_texture import TestTexture
+    from warp.tests.geometry.test_bvh import TestBvh
+    from warp.tests.geometry.test_hash_grid import TestHashGrid
+    from warp.tests.geometry.test_marching_cubes import TestMarchingCubes
+    from warp.tests.geometry.test_mesh import TestMesh
+    from warp.tests.geometry.test_mesh_query_aabb import TestMeshQueryAABBMethods
+    from warp.tests.geometry.test_mesh_query_point import TestMeshQueryPoint
+    from warp.tests.geometry.test_mesh_query_ray import TestMeshQueryRay
+    from warp.tests.geometry.test_volume import TestVolume
+    from warp.tests.geometry.test_volume_write import TestVolumeWrite
+    from warp.tests.interop.test_dlpack import TestDLPack
+    from warp.tests.interop.test_jax import TestJax
+    from warp.tests.interop.test_torch import TestTorch
+    from warp.tests.matrix.test_mat import TestMat
+    from warp.tests.matrix.test_mat_assign_copy import TestMatAssignCopy
+    from warp.tests.matrix.test_mat_basics import TestMatBasics
+    from warp.tests.matrix.test_mat_constructors import TestMatConstructors
+    from warp.tests.matrix.test_mat_elementwise_ops import TestMatElementwiseOps
+    from warp.tests.matrix.test_mat_linalg import TestMatLinalg
+    from warp.tests.matrix.test_mat_lite import TestMatLite
+    from warp.tests.test_adam import TestAdam
+    from warp.tests.test_arithmetic import TestArithmetic
+    from warp.tests.test_array import TestArray
+    from warp.tests.test_array_reduce import TestArrayReduce
+    from warp.tests.test_atomic import TestAtomic
+    from warp.tests.test_atomic_bitwise import TestAtomicBitwise
+    from warp.tests.test_atomic_cas import TestAtomicCAS
+    from warp.tests.test_block_dim_dispatch import TestBlockDimDispatch
+    from warp.tests.test_bool import TestBool
+    from warp.tests.test_builtins_resolution import TestBuiltinsResolution
+    from warp.tests.test_closest_point_edge_edge import TestClosestPointEdgeEdgeMethods
+    from warp.tests.test_codegen import TestCodeGen
+    from warp.tests.test_codegen_instancing import TestCodeGenInstancing
+    from warp.tests.test_compile_consts import TestConstants
+    from warp.tests.test_conditional import TestConditional
+    from warp.tests.test_context import TestContext
+    from warp.tests.test_copy import TestCopy
+    from warp.tests.test_ctypes import TestCTypes
+    from warp.tests.test_dense import TestDense
+    from warp.tests.test_devices import TestDevices
+    from warp.tests.test_diagnostics import TestDiagnostics
+    from warp.tests.test_examples import (
+        TestCoreExamples,
+        TestOptimExamples,
+    )
+    from warp.tests.test_fabricarray import TestFabricArray
+    from warp.tests.test_fast_math import TestFastMath
+    from warp.tests.test_fem import TestFem, TestFemShapeFunctions, TestFemUtilities
+    from warp.tests.test_fp16 import TestFp16
+    from warp.tests.test_func import TestFunc
+    from warp.tests.test_future_annotations import TestFutureAnnotations
+    from warp.tests.test_generics import TestGenerics
+    from warp.tests.test_grad import TestGrad
+    from warp.tests.test_grad_customs import TestGradCustoms
+    from warp.tests.test_grad_debug import TestGradDebug
+    from warp.tests.test_import import TestImport
+    from warp.tests.test_indexedarray import TestIndexedArray
+    from warp.tests.test_intersect import TestIntersect
+    from warp.tests.test_iter import TestIter
+    from warp.tests.test_kernel_cache import TestKernelCache
+    from warp.tests.test_large import TestLarge
+    from warp.tests.test_launch import TestLaunch
+    from warp.tests.test_lerp import TestLerp
+    from warp.tests.test_linear_solvers import TestLinearSolvers
+    from warp.tests.test_lvalue import TestLValue
+    from warp.tests.test_math import TestMath
+    from warp.tests.test_module_contamination import TestModuleContamination
+    from warp.tests.test_module_hashing import TestModuleHashing
+    from warp.tests.test_module_parallel_load import TestModuleParallelLoad
+    from warp.tests.test_modules_lite import TestModuleLite
+    from warp.tests.test_noise import TestNoise
+    from warp.tests.test_operators import TestOperators
+    from warp.tests.test_options import TestOptions
+    from warp.tests.test_overwrite import TestOverwrite
+    from warp.tests.test_print import TestPrint
+    from warp.tests.test_quat import TestQuat
+    from warp.tests.test_rand import TestRand
+    from warp.tests.test_reload import TestReload
+    from warp.tests.test_rounding import TestRounding
+    from warp.tests.test_runlength_encode import TestRunlengthEncode
+    from warp.tests.test_scalar_ops import TestScalarOps
+    from warp.tests.test_sgd import TestSGD
+    from warp.tests.test_smoothstep import TestSmoothstep
+    from warp.tests.test_snippet import TestSnippets
+    from warp.tests.test_sparse import TestSparse
+    from warp.tests.test_spatial import TestSpatial
+    from warp.tests.test_special_values import TestSpecialValues
+    from warp.tests.test_static import TestStatic
+    from warp.tests.test_struct import TestStruct
+    from warp.tests.test_subscript_types import TestSubscriptTypes
+    from warp.tests.test_tape import TestTape
+    from warp.tests.test_transient_module import TestTransientModule
+    from warp.tests.test_triangle_closest_point import TestTriangleClosestPoint
+    from warp.tests.test_types import TestTypes
+    from warp.tests.test_unique_module import TestUniqueModule
+    from warp.tests.test_utils import TestUtils
+    from warp.tests.test_vec import TestVec
+    from warp.tests.test_vec_constructors import TestVecConstructors
+    from warp.tests.test_vec_lite import TestVecLite
+    from warp.tests.test_vec_scalar_ops import TestVecScalarOps
+    from warp.tests.test_verify_fp import TestVerifyFP
+    from warp.tests.test_version import TestVersion
+    from warp.tests.tile.test_tile import TestTile
+    from warp.tests.tile.test_tile_atomic_bitwise import TestTileAtomicBitwise
+    from warp.tests.tile.test_tile_cholesky import TestTileCholesky
+    from warp.tests.tile.test_tile_func_arg import TestTileFuncArg
+    from warp.tests.tile.test_tile_load import TestTileLoad
+    from warp.tests.tile.test_tile_mathdx import TestTileMathDx
+    from warp.tests.tile.test_tile_matmul import TestTileMatmul
+    from warp.tests.tile.test_tile_matmul_no_mathdx import TestTileMatmulNoMathdx
+    from warp.tests.tile.test_tile_reduce import TestTileReduce
+    from warp.tests.tile.test_tile_shared_memory import TestTileSharedMemory
+    from warp.tests.tile.test_tile_sort import TestTileSort
+    from warp.tests.tile.test_tile_view import TestTileView
+
+    test_classes = [
+        TestAdam,
+        TestArithmetic,
+        TestArray,
+        TestArrayReduce,
+        TestAsync,
+        TestAtomic,
+        TestAtomicBitwise,
+        TestAtomicCAS,
+        TestBlockDimDispatch,
+        TestBool,
+        TestBuiltinsResolution,
+        TestBvh,
+        TestClosestPointEdgeEdgeMethods,
+        TestCodeGen,
+        TestCodeGenInstancing,
+        TestConditional,
+        TestConstants,
+        TestContext,
+        TestCopy,
+        TestCTypes,
+        TestCudaArchSuffix,
+        TestDense,
+        TestDevices,
+        TestDiagnostics,
+        TestDLPack,
+        TestCoreExamples,
+        TestOptimExamples,
+        TestFabricArray,
+        TestFastMath,
+        TestFem,
+        TestFemShapeFunctions,
+        TestFemUtilities,
+        TestFp16,
+        TestFunc,
+        TestFutureAnnotations,
+        TestGenerics,
+        TestGrad,
+        TestGradCustoms,
+        TestGradDebug,
+        TestHashGrid,
+        TestImport,
+        TestIndexedArray,
+        TestIntersect,
+        TestIter,
+        TestJax,
+        TestKernelCache,
+        TestLarge,
+        TestLaunch,
+        TestLerp,
+        TestLinearSolvers,
+        TestLValue,
+        TestMarchingCubes,
+        TestMat,
+        TestMatConstructors,
+        TestMatLite,
+        TestMatAssignCopy,
+        TestMatBasics,
+        TestMatElementwiseOps,
+        TestMatLinalg,
+        TestMath,
+        TestMempool,
+        TestMesh,
+        TestMeshQueryAABBMethods,
+        TestMeshQueryPoint,
+        TestMeshQueryRay,
+        TestModuleContamination,
+        TestModuleHashing,
+        TestModuleLite,
+        TestModuleParallelLoad,
+        TestMultiGPU,
+        TestNoise,
+        TestOperators,
+        TestOptions,
+        TestOverwrite,
+        TestPeer,
+        TestPinned,
+        TestPrint,
+        TestQuat,
+        TestRand,
+        TestReload,
+        TestRounding,
+        TestRunlengthEncode,
+        TestScalarOps,
+        TestSGD,
+        TestSmoothstep,
+        TestSnippets,
+        TestSparse,
+        TestSpatial,
+        TestSpecialValues,
+        TestStatic,
+        TestStreams,
+        TestStruct,
+        TestSubscriptTypes,
+        TestTape,
+        TestTexture,
+        TestTile,
+        TestTileAtomicBitwise,
+        TestTileCholesky,
+        TestTileFuncArg,
+        TestTileLoad,
+        TestTileMathDx,
+        TestTileMatmul,
+        TestTileMatmulNoMathdx,
+        TestTileReduce,
+        TestTileSharedMemory,
+        TestTileSort,
+        TestTileView,
+        TestTorch,
+        TestTransientModule,
+        TestTriangleClosestPoint,
+        TestTypes,
+        TestUniqueModule,
+        TestUtils,
+        TestVec,
+        TestVecConstructors,
+        TestVecLite,
+        TestVecScalarOps,
+        TestVerifyFP,
+        TestVersion,
+        TestVolume,
+        TestVolumeWrite,
+    ]
+
+    return _create_suite_from_test_classes(test_loader, test_classes)
+
+
+def debug_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader):
+    """Focused test suite for validating warp.config.mode = "debug".
+
+    Debug mode compiles kernels without optimizations and with full debug info,
+    which is significantly slower. This suite targets tests most likely to break
+    specifically in debug mode: codegen, gradients, generics, tile operations,
+    and complex kernel compilation patterns.
+
+    Usage:
+        python -m warp.tests --suite debug --warp-debug
+
+    Known debug-mode failures (`GH-1066 <https://github.com/NVIDIA/warp/issues/1066>`_):
+        - tile.test_tile: device-side assert in tile_broadcast_add_3d
+          (tile.h:1026, bounds check failure) which poisons the CUDA
+          context and cascades to all subsequent CUDA tests
+        - tile.test_tile_shared_memory: same tile.h:1026 bounds assert
+          in test_tile_shared_non_aligned
+        - tile.test_tile_cholesky: nvJitLink NVVM_ERROR_COMPILATION
+        - tile.test_tile_load: CUDA error 701 (too many resources for launch)
+        - tile.test_tile_mathdx: nvJitLink NVVM_ERROR_COMPILATION
+        - tile.test_tile_matmul: nvJitLink NVVM_ERROR_COMPILATION
+        - tile.test_tile_matmul_no_mathdx: nvJitLink NVVM_ERROR_COMPILATION
+        - test_verify_fp: deliberately triggers assertions which fire in debug
+    """
+    from warp.tests.geometry.test_bvh import TestBvh
+    from warp.tests.geometry.test_mesh import TestMesh
+    from warp.tests.matrix.test_mat_linalg import TestMatLinalg
+    from warp.tests.test_arithmetic import TestArithmetic
+    from warp.tests.test_atomic import TestAtomic
+    from warp.tests.test_builtins_resolution import TestBuiltinsResolution
+    from warp.tests.test_codegen import TestCodeGen
+    from warp.tests.test_codegen_instancing import TestCodeGenInstancing
+    from warp.tests.test_compile_consts import TestConstants
+    from warp.tests.test_conditional import TestConditional
+    from warp.tests.test_fast_math import TestFastMath
+    from warp.tests.test_fp16 import TestFp16
+    from warp.tests.test_func import TestFunc
+    from warp.tests.test_generics import TestGenerics
+    from warp.tests.test_grad import TestGrad
+    from warp.tests.test_grad_customs import TestGradCustoms
+    from warp.tests.test_grad_debug import TestGradDebug
+    from warp.tests.test_launch import TestLaunch
+    from warp.tests.test_lvalue import TestLValue
+    from warp.tests.test_math import TestMath
+    from warp.tests.test_module_hashing import TestModuleHashing
+    from warp.tests.test_operators import TestOperators
+    from warp.tests.test_options import TestOptions
+    from warp.tests.test_scalar_ops import TestScalarOps
+    from warp.tests.test_sparse import TestSparse
+    from warp.tests.test_spatial import TestSpatial
+    from warp.tests.test_static import TestStatic
+    from warp.tests.test_struct import TestStruct
+    from warp.tests.test_tape import TestTape
+    from warp.tests.test_types import TestTypes
+    from warp.tests.tile.test_tile_atomic_bitwise import TestTileAtomicBitwise
+    from warp.tests.tile.test_tile_reduce import TestTileReduce
+    from warp.tests.tile.test_tile_sort import TestTileSort
+    from warp.tests.tile.test_tile_view import TestTileView
+
+    test_classes = [
+        # Codegen & compilation
+        TestBuiltinsResolution,
+        TestCodeGen,
+        TestCodeGenInstancing,
+        TestConditional,
+        TestConstants,
+        TestFastMath,
+        TestFunc,
+        TestGenerics,
+        TestMath,
+        TestModuleHashing,
+        TestOperators,
+        TestOptions,
+        TestScalarOps,
+        TestStatic,
+        # Gradients
+        TestGrad,
+        TestGradCustoms,
+        TestGradDebug,
+        TestTape,
+        # Types & operators
+        TestArithmetic,
+        TestAtomic,
+        TestFp16,
+        TestLValue,
+        TestStruct,
+        TestTypes,
+        # Tile (debug-safe)
+        TestTileAtomicBitwise,
+        TestTileReduce,
+        TestTileSort,
+        TestTileView,
+        # Geometry
+        TestBvh,
+        TestMesh,
+        # Matrix
+        TestMatLinalg,
+        # Subsystem representatives
+        TestLaunch,
+        TestSparse,
+        TestSpatial,
+    ]
+
+    return _create_suite_from_test_classes(test_loader, test_classes)
